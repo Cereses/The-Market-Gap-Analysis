@@ -6,6 +6,7 @@ data/raw/
 
 # Allow the small cleaned subset
 !data/snacks_clean.parquet
+!data/cleaning_audit.csv
 
 # Python
 __pycache__/

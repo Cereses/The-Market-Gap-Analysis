@@ -1,0 +1,11 @@
+step,rows
+Raw snacks (global),331907
+EU markets only,193086
+Nutrition data present,172938
+Nutrients within 0-100g,172794
+Macros sum <= 100g,172689
+Energy 0-900 kcal,172473
+Deduplicated on barcode,172473
+Valid product names,168776
+Non-snack products removed,167657
+Baby food removed,166811
