@@ -33,8 +33,8 @@ under 5g sugar, and under 1.0g salt.**
 |---|---|
 | **Notebook** | [Google Colab](https://colab.research.google.com/drive/1s7Rnh1Fs8mzUAKSj9haxdWUfMamm1-qX) · also in [`notebooks/`](notebooks/) |
 | **Dashboard** | [sugar-trap-market-gap-jayden.streamlit.app](https://sugar-trap-market-gap-jayden.streamlit.app) |
-| **Presentation** | PASTE_SLIDES_LINK |
-| **PDF export** | [`exports/market_gap_analysis.pdf`](exports/) |
+| **Presentation** | [`presentation/sugar_trap_presentation.pptx`](presentation/sugar_trap_presentation.pptx) |
+| **PDF export** | [`exports/market_gap_analysis.pdf`](exports/market_gap_analysis.pdf) |
 
 ---
 
@@ -145,3 +145,4 @@ worse. That failure would have surfaced at the packaging stage, after the money 
 
 Three hypotheses tested across the project, three came back weaker than I expected, all reported
 as found.
+
