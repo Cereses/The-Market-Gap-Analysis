@@ -181,16 +181,31 @@ with tab2:
 
 with tab3:
     st.subheader("Products in the Blue Ocean")
-    bo = d[d.quadrant == BLUE].sort_values("proteins_100g", ascending=False)
-    st.caption(f"{len(bo):,} products meet <{sugar_max}g sugar and ≥{protein_min}g protein.")
+    bo = d[d.quadrant == BLUE]
+    n_raw = len(bo)
+    bo = bo[bo.proteins_100g <= 40].sort_values("proteins_100g", ascending=False)
+    st.caption(
+        f"{n_raw:,} products meet <{sugar_max}g sugar and ≥{protein_min}g protein. "
+        f"Table excludes {n_raw - len(bo):,} with protein >40g/100g — implausible for a "
+        "finished snack and almost certainly data entry errors (e.g. confectionery listed "
+        "at 97g protein)."
+    )
     st.dataframe(
         bo[["product_name", "brands", "primary_category",
             "proteins_100g", "sugars_100g", "salt_100g"]].head(300),
         use_container_width=True, hide_index=True,
     )
+    st.info(
+        "**Note the top of this table:** pork rinds and cortezas de cerdo — 70g protein, 0g "
+        "sugar, and 3.7–9.4g salt. The blue ocean's highest-protein incumbents are salt bombs. "
+        "This is the Nutri-Score problem in product form."
+    )
+
     st.subheader("Who is already there?")
-    st.bar_chart(bo.brands.value_counts().head(15))
+    named = bo[bo.brands != "Unknown"]
+    st.bar_chart(named.brands.value_counts().head(15))
     st.caption(
-        "Retailer own-brand and small regional producers. No global snack manufacturer appears "
-        "in the top 15 — the space is commercially proven but has no branded incumbent."
+        f"Excludes {len(bo) - len(named):,} products with no brand recorded. The remainder is "
+        "retailer own-brand and small regional producers — no global snack manufacturer "
+        "appears in the top 15. The space is commercially proven but has no branded incumbent."
     )

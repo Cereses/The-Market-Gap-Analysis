@@ -1,0 +1,1310 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "id": "1e384147",
+      "metadata": {
+        "id": "1e384147"
+      },
+      "source": [
+        "# The \"Sugar Trap\": Market Gap Analysis\n",
+        "**Client:** Helix CPG Partners | **Analyst:** Jayden | **Data:** Open Food Facts\n",
+        "\n",
+        "Finding the \"blue ocean\" in the European snack aisle — product categories where demand for\n",
+        "high-protein, low-sugar options is not met by current offerings.\n",
+        "\n",
+        "**Contents:** Setup → Story 1 (Cleaning) → Story 2 (Categorisation) → Story 3 (Nutrient Matrix)\n",
+        "→ Story 4 (Recommendation) → Bonus → Candidate's Choice"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "a7036698",
+      "metadata": {
+        "id": "a7036698"
+      },
+      "source": [
+        "## Setup\n",
+        "\n",
+        "All configuration lives in one cell. `USE_DRIVE` caches intermediate files to the author's\n",
+        "Google Drive; set it to `False` for a fully portable run (the notebook will then download and\n",
+        "process the raw export from scratch)."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "6afa2205",
+      "metadata": {
+        "id": "6afa2205"
+      },
+      "outputs": [],
+      "source": [
+        "import os\n",
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "import plotly.io as pio\n",
+        "import plotly.express as px\n",
+        "from collections import Counter\n",
+        "\n",
+        "pd.set_option('display.max_columns', 50)\n",
+        "pio.renderers.default = \"colab\"\n",
+        "\n",
+        "USE_DRIVE = True   # author's environment; set False for a portable run\n",
+        "\n",
+        "WORK = './data'\n",
+        "if USE_DRIVE:\n",
+        "    try:\n",
+        "        from google.colab import drive\n",
+        "        drive.mount('/content/drive')\n",
+        "        WORK = '/content/drive/MyDrive/market_gap'\n",
+        "    except Exception as e:\n",
+        "        print(f\"Drive unavailable ({e}); falling back to {WORK}\")\n",
+        "os.makedirs(WORK, exist_ok=True)\n",
+        "print(\"Working dir:\", WORK)\n",
+        "\n",
+        "RAW_URL     = 'https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz'\n",
+        "RAW_GZ      = '/content/off.csv.gz'\n",
+        "RAW_PARQUET = f'{WORK}/snacks_raw.parquet'\n",
+        "\n",
+        "COLS = ['code','product_name','brands','countries_en','categories_tags',\n",
+        "        'ingredients_text','energy-kcal_100g','fat_100g','saturated-fat_100g',\n",
+        "        'sugars_100g','fiber_100g','proteins_100g','salt_100g','nutriscore_grade']\n",
+        "\n",
+        "NUM_COLS  = ['sugars_100g','proteins_100g','fat_100g','saturated-fat_100g',\n",
+        "             'fiber_100g','salt_100g','energy-kcal_100g']\n",
+        "TEXT_COLS = ['product_name','brands','countries_en','categories_tags',\n",
+        "             'ingredients_text','nutriscore_grade']\n",
+        "NUTRIENTS = ['sugars_100g','proteins_100g','fat_100g','fiber_100g','salt_100g']\n",
+        "\n",
+        "EU_MARKETS = ['France','Italy','Germany','Spain','United Kingdom',\n",
+        "              'Belgium','Switzerland','Netherlands']\n",
+        "EU_PATTERN = '|'.join(EU_MARKETS)\n",
+        "\n",
+        "SUGAR_MAX, PROTEIN_MIN = 10, 10\n",
+        "\n",
+        "audit = []\n",
+        "def log(step, df):\n",
+        "    audit.append({'step': step, 'rows': len(df)})\n",
+        "    print(f\"{step:<38} {len(df):>8,}\")"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "7e659a9c",
+      "metadata": {
+        "id": "7e659a9c"
+      },
+      "source": [
+        "### Ingestion\n",
+        "\n",
+        "The Open Food Facts export is ~4.5M products and tab-separated despite the `.csv` extension.\n",
+        "It is read in 200k-row chunks, filtering on `en:snacks` and keeping 14 of ~200 columns, so the\n",
+        "full file never sits in memory at once.\n",
+        "\n",
+        "*Before committing to this column list I read 5 rows to confirm the separator (211 columns, not 1)\n",
+        "and that every target column exists under the expected name — the OFF schema changes without\n",
+        "notice, and `nutriscore_grade` has previously been `nutrition_grade_fr`.*"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "6f142028",
+      "metadata": {
+        "id": "6f142028"
+      },
+      "outputs": [],
+      "source": [
+        "if os.path.exists(RAW_PARQUET):\n",
+        "    snacks = pd.read_parquet(RAW_PARQUET)\n",
+        "    print(\"Loaded cached raw extract:\", snacks.shape)\n",
+        "else:\n",
+        "    if not os.path.exists(RAW_GZ):\n",
+        "        !wget -q -c {RAW_URL} -O {RAW_GZ}\n",
+        "\n",
+        "    chunks, scanned = [], 0\n",
+        "    reader = pd.read_csv(RAW_GZ, sep='\\t', usecols=COLS, chunksize=200_000,\n",
+        "                         on_bad_lines='skip', low_memory=False,\n",
+        "                         encoding_errors='replace')\n",
+        "    for chunk in reader:\n",
+        "        scanned += len(chunk)\n",
+        "        mask = chunk['categories_tags'].fillna('').str.contains('en:snacks', case=False, na=False)\n",
+        "        if mask.any():\n",
+        "            chunks.append(chunk[mask])\n",
+        "    snacks = pd.concat(chunks, ignore_index=True)\n",
+        "    del chunks\n",
+        "    print(f\"Scanned {scanned:,} products -> {len(snacks):,} snacks\")"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "091e8d11",
+      "metadata": {
+        "id": "091e8d11"
+      },
+      "source": [
+        "### Schema normalisation\n",
+        "\n",
+        "Chunked reads infer dtypes per chunk, and `concat` resolves any conflict to `object` — so\n",
+        "nutrient columns can silently arrive as strings. Barcodes have leading zeros and must *stay*\n",
+        "strings. Both are set explicitly rather than left to inference."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "70cdabba",
+      "metadata": {
+        "id": "70cdabba"
+      },
+      "outputs": [],
+      "source": [
+        "snacks['code'] = snacks['code'].astype(str)\n",
+        "\n",
+        "for col in TEXT_COLS:\n",
+        "    if col in snacks.columns:\n",
+        "        snacks[col] = snacks[col].astype(str).replace({'nan': pd.NA, 'None': pd.NA})\n",
+        "\n",
+        "for col in NUM_COLS:\n",
+        "    if col in snacks.columns:\n",
+        "        snacks[col] = pd.to_numeric(snacks[col], errors='coerce')\n",
+        "\n",
+        "snacks['has_nutrition'] = snacks['sugars_100g'].notna() & snacks['proteins_100g'].notna()\n",
+        "\n",
+        "if not os.path.exists(RAW_PARQUET):\n",
+        "    snacks.to_parquet(RAW_PARQUET, index=False)\n",
+        "\n",
+        "log('Raw snacks (global)', snacks)\n",
+        "snacks[NUM_COLS].dtypes"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "48ee7a4c",
+      "metadata": {
+        "id": "48ee7a4c"
+      },
+      "source": [
+        "## Story 1: Data Ingestion & Clean-Up\n",
+        "\n",
+        "**Goal:** a dataset where every row is a real snack with trustworthy sugar and protein values —\n",
+        "because those two fields carry the entire recommendation.\n",
+        "\n",
+        "### The decision that shaped this analysis: geographic scope\n",
+        "\n",
+        "41% of snack rows have no sugar or protein value. Rather than dropping them blind, I tested\n",
+        "whether the missingness was random. It was not:"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "258da574",
+      "metadata": {
+        "id": "258da574"
+      },
+      "outputs": [],
+      "source": [
+        "pd.crosstab(snacks['countries_en'], snacks['has_nutrition'], normalize='index') \\\n",
+        "  .reindex(['France','United States','Italy','Germany','Spain','United Kingdom']) \\\n",
+        "  .round(3)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "a2d33803",
+      "metadata": {
+        "id": "a2d33803"
+      },
+      "source": [
+        "Every European market clusters at 86–95%. The US sits at **5.3%** — not a gradient, a cliff.\n",
+        "Open Food Facts is a European-origin, contributor-driven database; US entries appear to arrive\n",
+        "largely via bulk barcode imports with no nutrition panel parsed.\n",
+        "\n",
+        "**Implication:** a naive `dropna()` would have silently deleted the American market from a\n",
+        "\"global\" analysis, and any US finding would have rested on the 5% of products whose panels\n",
+        "someone chose to fill in — a self-selected sample.\n",
+        "\n",
+        "> **The US looks like the largest gap in the dataset. It is a data collection artifact, not a\n",
+        "> market opportunity.**\n",
+        "\n",
+        "**Decision:** scope the analysis to eight European markets (FR, IT, DE, ES, UK, BE, CH, NL).\n",
+        "This is defensible twice over — the data is reliable there, and the EU is a single coherent\n",
+        "regulatory and consumer market. A blended EU+US \"world\" gap would not be something R&D could\n",
+        "build against.\n",
+        "\n",
+        "*Note: `countries_en` is a comma-separated list, so markets are matched with `str.contains`, not\n",
+        "equality. A product sold in both France and the US is correctly retained — it is on a French shelf.*\n",
+        "\n",
+        "### Why drop rather than impute\n",
+        "\n",
+        "Imputing a missing sugar value from a category median would fabricate the exact quantity the\n",
+        "recommendation depends on. A product whose sugar figure I invented cannot be evidence of a\n",
+        "market gap. Within Europe, coverage is 89.6%, so dropping costs little and preserves integrity."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "b0710d67",
+      "metadata": {
+        "id": "b0710d67"
+      },
+      "outputs": [],
+      "source": [
+        "eu = snacks[snacks['countries_en'].fillna('').str.contains(EU_PATTERN, case=False, na=False)].copy()\n",
+        "log('EU markets only', eu)\n",
+        "\n",
+        "eu = eu[eu['has_nutrition']]\n",
+        "log('Nutrition data present', eu)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "4c65b11f",
+      "metadata": {
+        "id": "4c65b11f"
+      },
+      "source": [
+        "### Outlier rules and what they found\n",
+        "\n",
+        "| Rule | Rationale |\n",
+        "|---|---|\n",
+        "| Each nutrient in 0–100 g | A 100g serving cannot contain >100g of anything |\n",
+        "| sugar + protein + fat ≤ 100 g | Macros cannot exceed the product's own mass |\n",
+        "| Energy in 0–900 kcal/100g | 900 kcal/100g is pure fat — the physical ceiling |\n",
+        "| Deduplicate on `code` | Barcode is the primary key |\n",
+        "\n",
+        "First, what the failures actually look like (shown on the global set, before the EU filter):"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "7034b6aa",
+      "metadata": {
+        "id": "7034b6aa"
+      },
+      "outputs": [],
+      "source": [
+        "pre = snacks[snacks['has_nutrition']]\n",
+        "bad = pre[~pre[NUTRIENTS].apply(lambda s: s.isna() | s.between(0, 100)).all(axis=1)]\n",
+        "print(len(bad), \"rows with biologically impossible values (global)\")\n",
+        "bad[['product_name','sugars_100g','proteins_100g','fat_100g']] \\\n",
+        "   .sort_values('sugars_100g', ascending=False).head(10)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "dbd4710d",
+      "metadata": {
+        "id": "dbd4710d"
+      },
+      "source": [
+        "The failures are **structured, not random**. Several show repeating decimals — Haribo Banana at\n",
+        "1283.33g sugar, Caramello Koala at 355.56g, Nesquik at 727.27g — the signature of OFF deriving\n",
+        "`_100g` fields by scaling an entered per-serving value against a serving size that was wrong by\n",
+        "an order of magnitude. One product claims 74,000g of sugar per 100g, a milligram/gram unit\n",
+        "confusion. These are propagated calculation errors, not typos in the sugar field.\n",
+        "\n",
+        "*(278 impossible rows globally; 144 fall within the EU scope.)*"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "abcfd13c",
+      "metadata": {
+        "id": "abcfd13c"
+      },
+      "outputs": [],
+      "source": [
+        "for col in NUTRIENTS:\n",
+        "    if col in eu.columns:\n",
+        "        eu = eu[eu[col].isna() | eu[col].between(0, 100)]\n",
+        "log('Nutrients within 0-100g', eu)\n",
+        "\n",
+        "eu = eu[eu[['sugars_100g','proteins_100g','fat_100g']].sum(axis=1) <= 100]\n",
+        "log('Macros sum <= 100g', eu)\n",
+        "\n",
+        "if 'energy-kcal_100g' in eu.columns:\n",
+        "    eu = eu[eu['energy-kcal_100g'].isna() | eu['energy-kcal_100g'].between(0, 900)]\n",
+        "log('Energy 0-900 kcal', eu)\n",
+        "\n",
+        "eu = eu.drop_duplicates(subset=['code'])\n",
+        "log('Deduplicated on barcode', eu)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "739a48c4",
+      "metadata": {
+        "id": "739a48c4"
+      },
+      "source": [
+        "**Only 465 rows (0.27%) failed these rules.** The quality problem in this dataset is\n",
+        "missingness, not implausibility: where data was entered, it was overwhelmingly sane.\n",
+        "Deduplication removed exactly zero rows, confirming OFF enforces the barcode key.\n",
+        "\n",
+        "A product that cannot be named cannot be a recommendation, so rows without a usable\n",
+        "`product_name` are dropped:"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "1d5af3a0",
+      "metadata": {
+        "id": "1d5af3a0"
+      },
+      "outputs": [],
+      "source": [
+        "eu = eu[eu['product_name'].notna() & (eu['product_name'].str.strip() != '')]\n",
+        "log('Valid product names', eu)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "12f6d822",
+      "metadata": {
+        "id": "12f6d822"
+      },
+      "source": [
+        "### Removing products that are not snacks\n",
+        "\n",
+        "Two groups inherited an `en:snacks` tag through OFF's crowd-sourced hierarchy:\n",
+        "\n",
+        "**Dry baking mixes** (cake mix, muffin mix, brownie mix). Their nutrition is measured as sold:\n",
+        "flour and powder. Nobody eats them in that state; once egg, milk and oil are added and the\n",
+        "product is baked, the profile changes completely. Critically, they land in the *extremes of both\n",
+        "axes* — \"CHIA SEED MUFFIN MIX\" reads 4.3g sugar / 32.5g protein, which would place it squarely\n",
+        "in the blue ocean this analysis exists to find. Left in, they would corrupt the headline finding.\n",
+        "\n",
+        "**Baby food.** Purées and infant desserts are deliberately low-sugar, regulated differently, and\n",
+        "aimed at a consumer who is not this client's target. Same failure mode, smaller scale.\n",
+        "\n",
+        "*Tags are matched as exact set membership, not substrings. An early substring version wrongly\n",
+        "flagged Mott's Applesauce, because \"sauces\" is contained in \"applesauces\".*"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "476a8bd3",
+      "metadata": {
+        "id": "476a8bd3"
+      },
+      "outputs": [],
+      "source": [
+        "JUNK = {'en:cooking-helpers','en:baking-mixes','en:cake-mixes','en:dessert-mixes',\n",
+        "        'en:pastry-helpers','en:condiments','en:sauces'}\n",
+        "BABY = {'en:baby-foods','en:snacks-and-desserts-for-babies','en:baby-fruit-desserts',\n",
+        "        'en:from-6-months','en:dairy-dessert-for-baby','en:baby-snacks'}\n",
+        "\n",
+        "def has_any(tags, tagset):\n",
+        "    return bool(tagset & {t.strip() for t in (tags or '').split(',')})\n",
+        "\n",
+        "eu = eu[~eu['categories_tags'].fillna('').apply(lambda t: has_any(t, JUNK))]\n",
+        "log('Non-snack products removed', eu)\n",
+        "\n",
+        "eu = eu[~eu['categories_tags'].fillna('').apply(lambda t: has_any(t, BABY))]\n",
+        "log('Baby food removed', eu)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "d1f5011a",
+      "metadata": {
+        "id": "d1f5011a"
+      },
+      "source": [
+        "### Story 1 result\n",
+        "\n",
+        "50% of rows removed — but **97% of that loss comes from two documented scope decisions**\n",
+        "(US exclusion, missing nutrition). Every quality rule combined accounts for 816 rows, and\n",
+        "nameless products for 3,697."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "cee4bc89",
+      "metadata": {
+        "id": "cee4bc89"
+      },
+      "outputs": [],
+      "source": [
+        "pd.DataFrame(audit)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "5e1e2cb0",
+      "metadata": {
+        "id": "5e1e2cb0"
+      },
+      "source": [
+        "## Story 2: The Category Wrangler\n",
+        "\n",
+        "`categories_tags` is a comma-separated list of crowd-sourced tags, and products carry several at\n",
+        "once at different levels of a hierarchy — a single biscuit may be tagged\n",
+        "`en:snacks, en:sweet-snacks, en:biscuits-and-cakes, en:biscuits, en:chocolate-biscuits`."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "c292fd8b",
+      "metadata": {
+        "id": "c292fd8b"
+      },
+      "outputs": [],
+      "source": [
+        "tags = Counter()\n",
+        "for t in eu['categories_tags'].dropna():\n",
+        "    tags.update(x.strip() for x in t.split(','))\n",
+        "pd.Series(dict(tags.most_common(40)))"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "5f2f49f2",
+      "metadata": {
+        "id": "5f2f49f2"
+      },
+      "source": [
+        "### Three kinds of tag\n",
+        "\n",
+        "Counting tag frequency across the clean set shows they are not interchangeable:\n",
+        "\n",
+        "- **Parents** (`en:sweet-snacks`, `en:salty-snacks`) — too broad to be a category. Used only as\n",
+        "  a fallback.\n",
+        "- **Cross-cutting attributes** (`en:plant-based-foods` 16,255, `en:festive-foods` 6,767,\n",
+        "  `en:frozen-foods` 2,787) — these describe a *property*, not a form factor. A plant-based cake\n",
+        "  is still a cake. Made into buckets, `en:plant-based-foods` alone would have hijacked 10% of\n",
+        "  the data.\n",
+        "- **Real categories** (`en:crisps`, `en:cakes`, `en:dark-chocolates`, `en:nuts-and-their-products`)\n",
+        "  — the actual buckets.\n",
+        "\n",
+        "### Assignment logic\n",
+        "\n",
+        "Ordered first-match-wins over exact tag sets. Order is doing real work, because tags collide:\n",
+        "\n",
+        "- `en:chocolate-biscuits` (6,842 products) is both chocolate and biscuit. **Form factor wins** —\n",
+        "  it is eaten as a biscuit. Biscuits are therefore checked before Chocolate.\n",
+        "- `en:biscuits-and-crackers` spans sweet biscuits *and* savoury crackers. **Savoury is checked\n",
+        "  first**, or salted crackers would be classified sweet."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "6f672f2f",
+      "metadata": {
+        "id": "6f672f2f"
+      },
+      "outputs": [],
+      "source": [
+        "BUCKETS = [\n",
+        "    ('Bars & Protein Snacks', {'en:cereal-bars','en:bars','en:protein-bars',\n",
+        "                               'en:energy-bars','en:fruit-bars'}),\n",
+        "    ('Nuts & Seeds',          {'en:nuts-and-their-products','en:nuts','en:almonds',\n",
+        "                               'en:peanuts','en:cashew-nuts','en:seeds','en:pistachios'}),\n",
+        "    ('Dried Fruit',           {'en:dried-fruits','en:raisins','en:dates','en:dried-apricots'}),\n",
+        "    ('Chips & Savoury',       {'en:crisps','en:potato-crisps','en:chips-and-fries',\n",
+        "                               'en:crackers-appetizers','en:corn-chips','en:extruded-snacks',\n",
+        "                               'en:popcorn','en:pretzels','en:salty-snacks',\n",
+        "                               'en:taralli','it:taralli','en:extruded-crispbreads',\n",
+        "                               'en:chips','en:crispbreads'}),\n",
+        "    ('Biscuits & Cookies',    {'en:biscuits','en:chocolate-biscuits','en:shortbread-cookies',\n",
+        "                               'en:biscuits-and-crackers','en:cookies'}),\n",
+        "    ('Cakes & Pastries',      {'en:cakes','en:chocolate-cakes','en:viennoiseries','en:pastries',\n",
+        "                               'en:brioches','en:madeleines','en:panettone',\n",
+        "                               'en:sweet-pastries-and-pies'}),\n",
+        "    ('Chocolate',             {'en:dark-chocolates','en:milk-chocolates','en:chocolates',\n",
+        "                               'en:chocolate-candies','en:white-chocolates',\n",
+        "                               'en:cocoa-and-its-products'}),\n",
+        "    ('Confectionery',         {'en:candies','en:bonbons','en:gummies','en:marshmallows',\n",
+        "                               'en:confectioneries'}),\n",
+        "]\n",
+        "\n",
+        "FALLBACK = [('Other Sweet',   {'en:sweet-snacks'}),\n",
+        "            ('Other Savoury', {'en:salty-snacks'})]\n",
+        "\n",
+        "def assign(tags):\n",
+        "    t = {x.strip() for x in (tags or '').split(',')}\n",
+        "    for name, keys in BUCKETS + FALLBACK:\n",
+        "        if t & keys:\n",
+        "            return name\n",
+        "    return 'Other'\n",
+        "\n",
+        "eu['primary_category'] = eu['categories_tags'].apply(assign)\n",
+        "eu['primary_category'].value_counts(dropna=False)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "bbf5ba0f",
+      "metadata": {
+        "id": "bbf5ba0f"
+      },
+      "source": [
+        "#### Verification\n",
+        "\n",
+        "Two checks: how much is left unclassified, and whether the collision rule actually fired the way\n",
+        "it was designed to."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "bc69764f",
+      "metadata": {
+        "id": "bc69764f"
+      },
+      "outputs": [],
+      "source": [
+        "print(\"Other rate:\", (eu['primary_category'] == 'Other').mean().round(3))\n",
+        "print()\n",
+        "print(\"Where en:chocolate-biscuits landed:\")\n",
+        "print(eu[eu['categories_tags'].str.contains('en:chocolate-biscuits', na=False)]\n",
+        "        ['primary_category'].value_counts())"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "115622be",
+      "metadata": {
+        "id": "115622be"
+      },
+      "source": [
+        "### Result — 9 buckets, 1.7% unclassified\n",
+        "\n",
+        "| Category | Products | Share |\n",
+        "|---|---|---|\n",
+        "| Cakes & Pastries | 32,909 | 19.7% |\n",
+        "| Chocolate | 30,540 | 18.3% |\n",
+        "| Biscuits & Cookies | 29,344 | 17.6% |\n",
+        "| Confectionery | 26,982 | 16.2% |\n",
+        "| Chips & Savoury | 25,541 | 15.3% |\n",
+        "| Bars & Protein Snacks | 8,621 | 5.2% |\n",
+        "| Other Sweet | 6,659 | 4.0% |\n",
+        "| Nuts & Seeds | 2,954 | 1.8% |\n",
+        "| Other | 2,900 | 1.7% |\n",
+        "| Dried Fruit | 361 | 0.2% |\n",
+        "\n",
+        "**The gap is already visible before any chart is drawn.** Four sweet categories are 72% of the\n",
+        "European snack aisle. Nuts, seeds and dried fruit together are 2.0%.\n",
+        "\n",
+        "*Caveat: Dried Fruit at 361 products is too thin to support a confident recommendation and\n",
+        "likely reflects OFF tagging conventions as much as shelf reality.*"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "5d1430ab",
+      "metadata": {
+        "id": "5d1430ab"
+      },
+      "outputs": [],
+      "source": [
+        "eu.to_parquet(f'{WORK}/snacks_eu_clean.parquet', index=False)\n",
+        "pd.DataFrame(audit).to_csv(f'{WORK}/cleaning_audit.csv', index=False)\n",
+        "print(\"Saved:\", len(eu), \"rows\")"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "66b5380c",
+      "metadata": {
+        "id": "66b5380c"
+      },
+      "source": [
+        "## Story 3: The Nutrient Matrix\n",
+        "\n",
+        "### Defining the quadrants\n",
+        "\n",
+        "**10g sugar / 100g** is roughly where EU nutrient-profile schemes begin flagging a product as\n",
+        "high-sugar. **10g protein / 100g** is a reasonable \"high protein\" bar. Both are judgement calls,\n",
+        "so the sensitivity of the finding to these thresholds is tested below rather than assumed."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "7ae18314",
+      "metadata": {
+        "id": "7ae18314"
+      },
+      "outputs": [],
+      "source": [
+        "eu['quadrant'] = np.select(\n",
+        "    [(eu.sugars_100g <  SUGAR_MAX) & (eu.proteins_100g >= PROTEIN_MIN),\n",
+        "     (eu.sugars_100g >= SUGAR_MAX) & (eu.proteins_100g >= PROTEIN_MIN),\n",
+        "     (eu.sugars_100g <  SUGAR_MAX) & (eu.proteins_100g <  PROTEIN_MIN)],\n",
+        "    ['Blue Ocean (Low Sugar, High Protein)',\n",
+        "     'High Sugar + High Protein',\n",
+        "     'Low Sugar, Low Protein'],\n",
+        "    default='Sugar Trap (High Sugar, Low Protein)')\n",
+        "\n",
+        "eu['quadrant'].value_counts(normalize=True).round(3)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "a1b800b4",
+      "metadata": {
+        "id": "a1b800b4"
+      },
+      "source": [
+        "The blue ocean is not empty — it holds ~11,300 products. The honest framing is a **saturation\n",
+        "ratio: the European snack aisle runs roughly 10:1 sugar-trap to blue-ocean.**\n",
+        "\n",
+        "### Where each category sits"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "f48dcbbb",
+      "metadata": {
+        "id": "f48dcbbb"
+      },
+      "outputs": [],
+      "source": [
+        "stats = eu.groupby('primary_category').agg(\n",
+        "    products=('code','size'),\n",
+        "    median_sugar=('sugars_100g','median'),\n",
+        "    median_protein=('proteins_100g','median'),\n",
+        ").round(1).sort_values('products', ascending=False)\n",
+        "stats"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "5693d713",
+      "metadata": {
+        "id": "5693d713"
+      },
+      "outputs": [],
+      "source": [
+        "print(\"Absolute counts by category and quadrant:\")\n",
+        "pd.crosstab(eu.primary_category, eu.quadrant)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "db2defd1",
+      "metadata": {
+        "id": "db2defd1"
+      },
+      "source": [
+        "### Sensitivity check\n",
+        "\n",
+        "If the recommendation flips when the thresholds move, the finding is fragile and must be\n",
+        "disclosed. Testing four plausible cut-offs:"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "521ca70b",
+      "metadata": {
+        "id": "521ca70b"
+      },
+      "outputs": [],
+      "source": [
+        "for s, p in [(10,10), (12,8), (8,12), (5,15)]:\n",
+        "    q = ((eu.sugars_100g < s) & (eu.proteins_100g >= p))\n",
+        "    top = eu[q].primary_category.value_counts(normalize=True).head(2)\n",
+        "    print(f\"sugar<{s:>2}, protein>={p:>2}: {q.mean():.3f} blue ocean | top: {dict(top.round(2))}\")"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "f0062fa9",
+      "metadata": {
+        "id": "f0062fa9"
+      },
+      "source": [
+        "**Chips & Savoury ranks first at all four thresholds** (0.51 / 0.50 / 0.46 / 0.41). The finding\n",
+        "is not an artifact of where the lines were drawn.\n",
+        "\n",
+        "## The Nutrient Matrix\n",
+        "\n",
+        "Each point is a product: sugar on the X axis, protein on the Y. Dashed lines mark the 10g/10g\n",
+        "thresholds; the shaded region is the blue ocean. Plotted on a random sample of 6,000 for\n",
+        "legibility — **every statistic in this notebook is computed on the full 166,811 rows.**\n",
+        "\n",
+        "The scatter shows the shape; the stacked bar below shows the argument."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "xaBrpgdP9s4o",
+      "metadata": {
+        "id": "xaBrpgdP9s4o"
+      },
+      "outputs": [],
+      "source": [
+        "samp = eu.sample(min(len(eu), 6000), random_state=42).copy()\n",
+        "samp['brands'] = samp['brands'].fillna('Unknown').astype(str)\n",
+        "\n",
+        "fig = px.scatter(\n",
+        "    samp, x='sugars_100g', y='proteins_100g', color='primary_category',\n",
+        "    hover_name='product_name', hover_data={'brands': True},\n",
+        "    opacity=0.35,\n",
+        "    color_discrete_sequence=px.colors.qualitative.Dark24,\n",
+        "    labels={'sugars_100g': 'Sugar (g per 100g)',\n",
+        "            'proteins_100g': 'Protein (g per 100g)',\n",
+        "            'primary_category': 'Category'},\n",
+        "    title='The Nutrient Matrix — European snack aisle (n=6,000 sample)')\n",
+        "\n",
+        "fig.update_traces(marker=dict(size=4))\n",
+        "fig.add_shape(type='rect', x0=0, x1=SUGAR_MAX, y0=PROTEIN_MIN, y1=50,\n",
+        "              fillcolor='green', opacity=0.10, line_width=0, layer='below')\n",
+        "fig.add_vline(x=SUGAR_MAX, line_dash='dash', line_color='grey')\n",
+        "fig.add_hline(y=PROTEIN_MIN, line_dash='dash', line_color='grey')\n",
+        "\n",
+        "fig.add_annotation(x=5, y=30, ax=70, ay=-45,\n",
+        "                   text='<b>BLUE OCEAN</b><br>6.8% of products',\n",
+        "                   showarrow=True, arrowhead=2, arrowcolor='#2E7D32',\n",
+        "                   font=dict(color='#2E7D32', size=12))\n",
+        "\n",
+        "fig.add_annotation(x=40, y=4, ax=0, ay=-75,\n",
+        "                   text='<b>SUGAR TRAP</b><br>70.7% of products',\n",
+        "                   showarrow=True, arrowhead=2, arrowcolor='#C62828',\n",
+        "                   font=dict(color='#C62828', size=12))\n",
+        "\n",
+        "fig.update_layout(height=620, width=900,\n",
+        "                  yaxis_range=[0, 50], xaxis_range=[0, 85],\n",
+        "                  plot_bgcolor='white')\n",
+        "fig.update_xaxes(gridcolor='#EEE'); fig.update_yaxes(gridcolor='#EEE')\n",
+        "fig.show()"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "bpEclWdm94Cj",
+      "metadata": {
+        "id": "bpEclWdm94Cj"
+      },
+      "outputs": [],
+      "source": [
+        "q_pct = (pd.crosstab(eu.primary_category, eu.quadrant, normalize='index') * 100).round(1)\n",
+        "q_pct = q_pct.loc[stats.index[::-1]]   # reverse: biggest category ends up on top\n",
+        "\n",
+        "fig2 = px.bar(q_pct, orientation='h',\n",
+        "              color_discrete_map={\n",
+        "                  'Blue Ocean (Low Sugar, High Protein)': '#2E7D32',\n",
+        "                  'Low Sugar, Low Protein': '#A5D6A7',\n",
+        "                  'High Sugar + High Protein': '#FFB74D',\n",
+        "                  'Sugar Trap (High Sugar, Low Protein)': '#C62828'},\n",
+        "              labels={'value': '% of category', 'primary_category': ''},\n",
+        "              category_orders={'quadrant': [\n",
+        "                  'Blue Ocean (Low Sugar, High Protein)',\n",
+        "                  'Low Sugar, Low Protein',\n",
+        "                  'High Sugar + High Protein',\n",
+        "                  'Sugar Trap (High Sugar, Low Protein)']},\n",
+        "              title='Where each category sits — % of products by quadrant')\n",
+        "fig2.update_layout(height=520, width=980, barmode='stack',\n",
+        "                   xaxis_range=[0, 100], legend_title_text='',\n",
+        "                   legend=dict(orientation='h', y=-0.15))\n",
+        "fig2.show()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "aa18f754",
+      "metadata": {
+        "id": "aa18f754"
+      },
+      "source": [
+        "## Story 4: The Recommendation\n",
+        "\n",
+        "### Who is already in the blue ocean?"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "8f09962c",
+      "metadata": {
+        "id": "8f09962c"
+      },
+      "outputs": [],
+      "source": [
+        "bo_chips = eu[(eu.primary_category == 'Chips & Savoury') &\n",
+        "              (eu.quadrant == 'Blue Ocean (Low Sugar, High Protein)')]\n",
+        "\n",
+        "print(bo_chips.brands.value_counts().head(15))\n",
+        "print()\n",
+        "print(bo_chips[['proteins_100g','sugars_100g']].describe().round(1))"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "55db3ba4",
+      "metadata": {
+        "id": "55db3ba4"
+      },
+      "outputs": [],
+      "source": [
+        "bo_chips[['product_name','brands','proteins_100g','sugars_100g']].sample(15, random_state=1)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "fa0ba06a",
+      "metadata": {
+        "id": "fa0ba06a"
+      },
+      "source": [
+        "### Why savoury, not nuts\n",
+        "\n",
+        "**Nuts & Seeds** has the better hit rate — 56% of the category already clears the bar — but it\n",
+        "is 1.8% of the aisle and only ~1,650 products. It proves the profile is achievable; it is not a\n",
+        "platform.\n",
+        "\n",
+        "**Chips & Savoury** has 6,126 products in the blue ocean, nearly 4× the volume. More\n",
+        "importantly: **17,370 of its products (68%) sit in \"Low Sugar, Low Protein.\"** They have already\n",
+        "solved sugar. The distance from there to the blue ocean is a few grams of protein — versus\n",
+        "asking a chocolate manufacturer to strip 35g of sugar from a bar and keep it edible.\n",
+        "\n",
+        "The products already there are telling: Scrocchi, Bake rolls, Vollkorn Sticks, Crackers apéritif\n",
+        "nature. These are crackers and breadsticks whose 10–12g protein comes from wheat gluten\n",
+        "*incidentally*. Nobody formulated them as protein snacks — they are in the blue ocean by\n",
+        "accident, with no health positioning behind them.\n",
+        "\n",
+        "**The gap is not capability. It is assortment.**\n",
+        "\n",
+        "## 🎯 Key Insight\n",
+        "\n",
+        "> **Based on the data, the biggest market opportunity is in Savoury Snacks (chips & crackers),\n",
+        "> specifically targeting products with 15g of protein and less than 5g of sugar.**\n",
+        "\n",
+        "15g is the 75th percentile of products *already succeeding* in this quadrant (median 12.3g) — an\n",
+        "empirically achievable target, not an aspiration. Under 5g of sugar is comfortably above the\n",
+        "quadrant's median of 2.3g.\n",
+        "\n",
+        "**The whitespace:** deliberately formulated, branded, high-protein savoury snacking. The\n",
+        "category is proven by 6,126 products, mass-market at 25,541 products, and has no branded\n",
+        "incumbent."
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "62101981",
+      "metadata": {
+        "id": "62101981"
+      },
+      "source": [
+        "---\n",
+        "\n",
+        "# Candidate's Choice: Stress-testing the recommendation\n",
+        "\n",
+        "**Why I added this.** Story 4 says *where* the gap is. It does not say whether the gap is real\n",
+        "or whether the recommendation survives contact with the outside world. Two questions a client\n",
+        "asks immediately, neither of which the brief requires me to answer:\n",
+        "\n",
+        "1. **If this space is so attractive, is someone already quietly winning it?**\n",
+        "2. **Would the product I am recommending actually look healthy to a consumer?**\n",
+        "\n",
+        "Both are tested below. The first came back negative — I have kept it in, because a hypothesis\n",
+        "that fails is still evidence, and reporting only the tests that worked would misrepresent the\n",
+        "analysis.\n",
+        "\n",
+        "## Test 1: Is the blue ocean owned by retailer own-brand?\n",
+        "\n",
+        "**Hypothesis:** the top brands in the high-protein savoury quadrant are supermarket labels\n",
+        "(Carrefour, Auchan, Picard, Casino, U), which would suggest retailers have quietly filled a gap\n",
+        "the big manufacturers ignored."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "uYY2G-6oFb2g",
+      "metadata": {
+        "id": "uYY2G-6oFb2g"
+      },
+      "outputs": [],
+      "source": [
+        "PRIVATE_LABEL = [\n",
+        "    'carrefour','auchan','casino','leader price','picard','monoprix','franprix',\n",
+        "    'lidl','aldi','tesco','sainsbury','asda','morrisons','marks & spencer',\n",
+        "    'migros','coop','delhaize','albert heijn','edeka','rewe','conad','esselunga',\n",
+        "    'eroski','mercadona','dia','intermarché','netto','penny','u ','super u','systeme u',\n",
+        "]\n",
+        "\n",
+        "def is_private_label(b):\n",
+        "    b = str(b).lower()\n",
+        "    return any(p in b for p in PRIVATE_LABEL)\n",
+        "\n",
+        "chips = eu[eu.primary_category == 'Chips & Savoury'].copy()\n",
+        "chips['private_label'] = chips['brands'].apply(is_private_label)\n",
+        "\n",
+        "pl = (chips.groupby('quadrant')['private_label']\n",
+        "           .agg(products='size', private_label_share='mean')\n",
+        "           .round(3)\n",
+        "           .sort_values('products', ascending=False))\n",
+        "print(\"Private-label penetration by quadrant — Chips & Savoury\\n\")\n",
+        "print(pl)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "yTg_QGJTFgqd",
+      "metadata": {
+        "id": "yTg_QGJTFgqd"
+      },
+      "outputs": [],
+      "source": [
+        "fig3 = px.bar(pl.reset_index(), x='quadrant', y='private_label_share',\n",
+        "              text=pl.reset_index()['private_label_share'].map(lambda v: f\"{v:.0%}\"),\n",
+        "              labels={'private_label_share': 'Private label share', 'quadrant': ''},\n",
+        "              title='Retailer own-brand penetration by quadrant (Chips & Savoury)')\n",
+        "fig3.update_traces(marker_color='#455A64', textposition='outside')\n",
+        "fig3.update_layout(height=440, width=880, yaxis_tickformat='.0%')\n",
+        "fig3.show()"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "DqONFH5QI-Nw",
+      "metadata": {
+        "id": "DqONFH5QI-Nw"
+      },
+      "outputs": [],
+      "source": [
+        "for q in ['Blue Ocean (Low Sugar, High Protein)', 'Sugar Trap (High Sugar, Low Protein)']:\n",
+        "    sub = chips[chips.quadrant == q]\n",
+        "    top10 = sub.brands.value_counts().head(10).sum()\n",
+        "    print(f\"{q[:20]:<22} n={len(sub):>6,} | top-10 brands = {top10/len(sub):.1%} of category\")"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "id": "46558994",
+      "metadata": {
+        "id": "46558994"
+      },
+      "source": [
+        "### Test 1 result: hypothesis rejected\n",
+        "\n",
+        "**Private-label penetration is essentially flat across all four quadrants (12–16%).** The blue\n",
+        "ocean is not retailer territory. Own-brand is no more likely to sit there than in the sugar trap.\n",
+        "\n",
+        "The concentration check is equally flat: the **top 10 brands account for 9.0% of the blue ocean\n",
+        "and 8.4% of the sugar trap.** Whatever explains the gap, it is not that someone is already\n",
+        "winning it — and fragmentation is not distinctive to the opportunity, it is just what this\n",
+        "category looks like.\n",
+        "\n",
+        "**What this test does establish**, weakly: the largest single brand in the blue ocean is\n",
+        "Carrefour with 78 products — **1.3% of 6,126** — and no global snack manufacturer appears in the\n",
+        "top 15 at all. There is no incumbent to displace.\n",
+        "\n",
+        "**Why the test could not do more.** Open Food Facts is a *product census*, not a sales panel. It\n",
+        "records that a product exists; it records nothing about volume, shelf facings, or revenue. A\n",
+        "brand with 78 SKUs might dominate the category or might be invisible in it. Brand concentration\n",
+        "in this dataset cannot answer a market-share question, and I should have recognised that before\n",
+        "running it rather than after.\n",
+        "\n",
+        "---\n",
+        "\n",
+        "## Test 2: Would the recommended product look healthy on the shelf?\n",
+        "\n",
+        "**The risk.** I am recommending savoury snacks. Savoury means salt. The EU's Nutri-Score\n",
+        "algorithm penalises salt heavily. If high-protein crackers score C or D, the client builds a\n",
+        "product that is nutritionally sound and *looks unhealthy on the front of the pack* — a\n",
+        "commercial problem the nutrient matrix cannot see, because salt is not on either axis.\n",
+        "\n",
+        "`nutriscore_grade` has been carried through the pipeline since ingestion and is not used\n",
+        "anywhere else in this analysis. It is an independent, externally-defined judgement of the exact\n",
+        "products I am recommending."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "af45ce74",
+      "metadata": {
+        "id": "af45ce74"
+      },
+      "outputs": [],
+      "source": [
+        "scored = eu[eu['nutriscore_grade'].notna() &\n",
+        "            eu['nutriscore_grade'].str.lower().isin(list('abcde'))].copy()\n",
+        "scored['nutriscore_grade'] = scored['nutriscore_grade'].str.upper()\n",
+        "\n",
+        "print(f\"Nutri-Score coverage: {len(scored):,} of {len(eu):,} ({len(scored)/len(eu):.1%})\")\n",
+        "print(\"\\nNutri-Score distribution by quadrant (row %):\")\n",
+        "\n",
+        "ns = pd.crosstab(scored.quadrant, scored.nutriscore_grade, normalize='index').round(3)\n",
+        "ns = ns[[c for c in list('ABCDE') if c in ns.columns]]\n",
+        "ns"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "0b2bf540",
+      "metadata": {
+        "id": "0b2bf540"
+      },
+      "outputs": [],
+      "source": [
+        "bo = scored[scored.quadrant == 'Blue Ocean (Low Sugar, High Protein)']\n",
+        "\n",
+        "print(f\"{'Segment':<48} {'n':>7}  {'A or B':>7}  {'median salt':>12}\")\n",
+        "print(\"-\" * 78)\n",
+        "for label, df in [('Blue Ocean — all categories', bo),\n",
+        "                  ('Blue Ocean — Chips & Savoury (my recommendation)',\n",
+        "                   bo[bo.primary_category == 'Chips & Savoury']),\n",
+        "                  ('Blue Ocean — Nuts & Seeds', bo[bo.primary_category == 'Nuts & Seeds'])]:\n",
+        "    if len(df):\n",
+        "        print(f\"{label:<48} {len(df):>7,}  {df.nutriscore_grade.isin(['A','B']).mean():>6.1%}  \"\n",
+        "              f\"{df.salt_100g.median():>11.2f}g\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "199947dc",
+      "metadata": {
+        "id": "199947dc"
+      },
+      "outputs": [],
+      "source": [
+        "print(\"Median salt by category (g per 100g):\")\n",
+        "eu.groupby('primary_category')['salt_100g'].median().round(2).sort_values(ascending=False)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "id": "310d5214",
+      "metadata": {
+        "id": "310d5214"
+      },
+      "outputs": [],
+      "source": [
+        "ns_plot = ns.reset_index().melt(id_vars='quadrant', var_name='Nutri-Score', value_name='share')\n",
+        "\n",
+        "fig4 = px.bar(ns_plot, x='quadrant', y='share', color='Nutri-Score',\n",
+        "              color_discrete_map={'A': '#1E8F4E', 'B': '#8BC34A', 'C': '#FFC107',\n",
+        "                                  'D': '#FF7043', 'E': '#D32F2F'},\n",
+        "              category_orders={'Nutri-Score': list('ABCDE')},\n",
+        "              labels={'share': '% of quadrant', 'quadrant': ''},\n",
+        "              title='Nutri-Score distribution by quadrant — an external check on the recommendation')\n",
+        "fig4.update_layout(height=460, width=920, barmode='stack', yaxis_tickformat='.0%',\n",
+        "                   legend=dict(orientation='h', y=-0.25))\n",
+        "fig4.show()"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "chips_bo = eu[(eu.primary_category=='Chips & Savoury') & (eu.quadrant.str.startswith('Blue'))]\n",
+        "print(\"salt~protein corr within blue-ocean savoury:\",\n",
+        "      chips_bo[['salt_100g','proteins_100g']].corr().iloc[0,1].round(3))"
+      ],
+      "metadata": {
+        "id": "ukTWLcL1MS5S"
+      },
+      "id": "ukTWLcL1MS5S",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "### Test 2 result: the recommendation survives — but it is now a three-variable brief\n",
+        "\n",
+        "**Nutri-Score coverage: 155,100 of 166,811 products (93.0%)** — high enough to draw on without\n",
+        "material caveat.\n",
+        "\n",
+        "#### First, the quadrants validate\n",
+        "\n",
+        "| Quadrant | A | B | C | D | E |\n",
+        "|---|---|---|---|---|---|\n",
+        "| **Blue Ocean** | 8.4% | 5.0% | 20.7% | 42.5% | 23.3% |\n",
+        "| Low Sugar, Low Protein | 3.1% | 6.3% | 24.2% | 48.1% | 18.4% |\n",
+        "| High Sugar + High Protein | 0.5% | 0.4% | 5.4% | 39.9% | 53.7% |\n",
+        "| **Sugar Trap** | 0.1% | 0.1% | 2.6% | 19.9% | **77.3%** |\n",
+        "\n",
+        "The blue ocean has the highest A+B share; the sugar trap is 77.3% grade E. An external,\n",
+        "regulator-adjacent algorithm that knows nothing about my 10g/10g thresholds independently orders\n",
+        "the quadrants exactly as I did. That is genuine corroboration.\n",
+        "\n",
+        "#### Then, the problem\n",
+        "\n",
+        "| Segment | n | A or B | Median salt |\n",
+        "|---|---|---|---|\n",
+        "| Blue Ocean — all categories | 10,410 | 13.5% | 1.50g |\n",
+        "| **Blue Ocean — Chips & Savoury (my recommendation)** | **5,993** | **9.2%** | **1.78g** |\n",
+        "| Blue Ocean — Nuts & Seeds | 1,614 | 20.0% | 1.07g |\n",
+        "\n",
+        "**My recommendation scores worst of the three.** Blue-ocean savoury snacks earn an A or B only\n",
+        "9.2% of the time — below the blue ocean average, and less than half the rate of Nuts & Seeds.\n",
+        "Over 65% are D or E.\n",
+        "\n",
+        "**The cause is salt.** Chips & Savoury has the highest median salt of any category at\n",
+        "1.40g/100g — 10× Chocolate (0.14g), 23× Confectionery (0.06g). Blue-ocean savoury products are\n",
+        "saltier still, at **1.78g**. Nutri-Score penalises salt heavily, so a product can clear both of\n",
+        "my axes and still be graded D, because the third variable — the one the nutrient matrix cannot\n",
+        "show — undoes it.\n",
+        "\n",
+        "*I tested whether protein and salt are coupled within blue-ocean savoury, the intuition being\n",
+        "that protein arrives via cheese, cured meat and salted gluten. The correlation is weak,\n",
+        "**r = 0.105** — the data does not support that mechanism, though looking only within a\n",
+        "high-protein subset restricts the range and likely attenuates it. **The salt problem is real\n",
+        "descriptively; its cause is not established here.** The reformulation constraint stands either\n",
+        "way.*\n",
+        "\n",
+        "### What this changes\n",
+        "\n",
+        "**It does not overturn the recommendation.** Chips & Savoury still has 6,126 blue-ocean products\n",
+        "against ~1,650 for nuts, 17,370 low-sugar/low-protein products sitting one variable away, and\n",
+        "25,541 products of category scale against 2,954. The gap is real and the category is right.\n",
+        "\n",
+        "**But it converts a two-variable brief into a three-variable one:**\n",
+        "\n",
+        "> **Target 15g protein, under 5g sugar, and under 1.0g salt.**\n",
+        "\n",
+        "That third number is the hard part, and it is now the *actual* R&D problem: existing blue-ocean\n",
+        "savoury products sit at 1.78g median salt, so hitting the protein target at under 1.0g means\n",
+        "departing from how the category currently builds these products rather than copying it.\n",
+        "\n",
+        "**This also strengthens the secondary case for Nuts & Seeds** as a launch or halo SKU: 20% A/B\n",
+        "and 1.07g salt — the profile achieved without a salt penalty. It lacks the volume to be the\n",
+        "platform, but it demonstrates the target is reachable.\n",
+        "\n",
+        "Without this check, the client could have hit both stated targets and shipped a product graded\n",
+        "D — competing on a health platform against confectionery that grades no worse. The positioning\n",
+        "would have collapsed at the packaging stage, after R&D had spent the money.\n",
+        "\n",
+        "### Why I added this\n",
+        "\n",
+        "The brief asked me to find the gap. It did not ask whether the product I was recommending would\n",
+        "survive its own label. Nutri-Score was sitting unused in the dataset — externally defined,\n",
+        "independent of every threshold I chose, and computed over the exact products in my\n",
+        "recommendation. It cost one column.\n",
+        "\n",
+        "**It found that my two-axis analysis was projecting away the variable that decides whether the\n",
+        "product works.** Three hypotheses tested across this section, three came back weaker than\n",
+        "expected — reported as found. That is worth more than a third chart confirming what I already\n",
+        "believed."
+      ],
+      "metadata": {
+        "id": "03WL2kV0M07i"
+      },
+      "id": "03WL2kV0M07i"
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "pd.crosstab(eu.primary_category, eu.quadrant).loc['Chips & Savoury']"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 241
+        },
+        "id": "wLyUaQsDU1mF",
+        "outputId": "1a009817-08c7-484f-8933-4def143a93a4"
+      },
+      "id": "wLyUaQsDU1mF",
+      "execution_count": 63,
+      "outputs": [
+        {
+          "output_type": "execute_result",
+          "data": {
+            "text/plain": [
+              "quadrant\n",
+              "Blue Ocean (Low Sugar, High Protein)     6126\n",
+              "High Sugar + High Protein                 340\n",
+              "Low Sugar, Low Protein                  17370\n",
+              "Sugar Trap (High Sugar, Low Protein)     1705\n",
+              "Name: Chips & Savoury, dtype: int64"
+            ],
+            "text/html": [
+              "<div>\n",
+              "<style scoped>\n",
+              "    .dataframe tbody tr th:only-of-type {\n",
+              "        vertical-align: middle;\n",
+              "    }\n",
+              "\n",
+              "    .dataframe tbody tr th {\n",
+              "        vertical-align: top;\n",
+              "    }\n",
+              "\n",
+              "    .dataframe thead th {\n",
+              "        text-align: right;\n",
+              "    }\n",
+              "</style>\n",
+              "<table border=\"1\" class=\"dataframe\">\n",
+              "  <thead>\n",
+              "    <tr style=\"text-align: right;\">\n",
+              "      <th></th>\n",
+              "      <th>Chips &amp; Savoury</th>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>quadrant</th>\n",
+              "      <th></th>\n",
+              "    </tr>\n",
+              "  </thead>\n",
+              "  <tbody>\n",
+              "    <tr>\n",
+              "      <th>Blue Ocean (Low Sugar, High Protein)</th>\n",
+              "      <td>6126</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>High Sugar + High Protein</th>\n",
+              "      <td>340</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>Low Sugar, Low Protein</th>\n",
+              "      <td>17370</td>\n",
+              "    </tr>\n",
+              "    <tr>\n",
+              "      <th>Sugar Trap (High Sugar, Low Protein)</th>\n",
+              "      <td>1705</td>\n",
+              "    </tr>\n",
+              "  </tbody>\n",
+              "</table>\n",
+              "</div><br><label><b>dtype:</b> int64</label>"
+            ]
+          },
+          "metadata": {},
+          "execution_count": 63
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "toc_visible": true
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.12"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
