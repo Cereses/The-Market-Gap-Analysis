@@ -1,0 +1,18 @@
+﻿# Raw data - never commit
+data/raw/
+*.csv
+*.csv.gz
+*.tsv
+
+# Allow the small cleaned subset
+!data/snacks_clean.parquet
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
